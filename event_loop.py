@@ -1,105 +1,96 @@
 import inspect
+from collections import deque
 from dataclasses import dataclass
-from typing import Generator, Optional, Any
+from typing import Generator, Optional, Any, Deque
 
 
 @dataclass
 class Result:
-    value: Any
+    exception: Exception = None
+    returned_value: Any = None
 
 
 @dataclass
 class Task:
     generator: Generator
+    caller: Optional["Task"] = None
     result: Optional[Result] = None
-    exception: Optional[Result] = None
-
-    @property
-    def is_finished(self):
-        return bool(self.result or self.exception)
 
 
 class EventLoop:
 
     def __init__(self):
-        self.tasks = []
+        self.unfinished_tasks: Deque[Task] = deque()
 
-    def add_new_task(self, generator: Generator):
-        self.tasks.append(Task(generator))
+    def create_task(self, generator: Generator):
+        if not inspect.isgenerator(generator):
+            raise TypeError(
+                f"Task can be created only from a generator, not from "
+                f"{generator}!"
+            )
+        task = Task(generator)
+        self.unfinished_tasks.append(task)
+        return task
 
-    def _run_task(self, task: Task):
-        while not task.is_finished:
-            self._push_task(task)
-
-    def _push_task(self, task: Task):
-        try:
-            new_generator = task.generator.send(None)
-            if new_generator is None:
-                
-            elif not inspect.isgenerator(new_generator):
-                raise TypeError(
-                    f"Object yielded from {task} was not a generator!"
-                )
-            new_task = Task(new_generator)
-            self._run_task(new_task)
-            if new_task.exception:
-                task.generator.throw(new_task.exception.value)
-            else:
-                task.generator.send(new_task.result.value)
-        except Exception as exception:
-            if isinstance(exception, StopIteration):
-                task.result = Result(exception.value)
-            else:
-                task.exception = Result(exception)
-
-    def _roll_next_task(self):
+    def _poll_task(self, task: Task, poll_with: Result) -> Optional[Result]:
         """
         Exception received => propagate to caller
                               (or raise from here if there is no caller)
         Result received => propagate to caller
         New generator received => add to loop as a task and return
         """
-        value_to_send = None
-        exception_to_throw = None
-        task: Task = self.tasks.pop()
-        while task:
-            # noinspection PyBroadException
-            try:
-                if exception_to_throw is None:
-                    saved_value_to_send = value_to_send
-                    value_to_send = None
-                    new_generator = task.generator.send(saved_value_to_send)
-                else:
-                    saved_exception_to_throw = exception_to_throw
-                    exception_to_throw = None
-                    new_generator = task.generator.throw(
-                        saved_exception_to_throw.__class__,
-                        saved_exception_to_throw,
-                        saved_exception_to_throw.__traceback__
-                    )
-            except Exception as exception:
-                if isinstance(exception, StopIteration):
-                    value_to_send = exception.value
-                else:
-                    if task.caller is None:
-                        raise
-                    else:
-                        exception_to_throw = exception
-                task = task.caller
+        try:
+            if poll_with.exception is None:
+                new_generator = task.generator.send(poll_with.returned_value)
             else:
-                if inspect.isgenerator(new_generator):
-                    self.tasks.append(Task(new_generator, caller=task))
-                    return
-                else:
-                    raise TypeError(
-                        f"Object yielded from {task} was not a generator!"
-                    )
+                new_generator = task.generator.throw(poll_with.exception)
+        except Exception as e:
+            if isinstance(e, StopIteration):
+                return Result(returned_value=e.value)
+            else:
+                return Result(exception=e)
+        else:
+            if new_generator is not None:
+                self.unfinished_tasks.append(
+                    Task(new_generator, caller=task)
+                )
+            else:
+                self.unfinished_tasks.append(task)
+            return None
+
+    def _roll_task(self):
+        task = self.unfinished_tasks.popleft()
+        poll_with = Result()
+        while True:
+            poll_with = self._poll_task(task, poll_with)
+            if poll_with is None:
+                break
+            else:
+                if task.caller is None:
+                    task.result = poll_with
+                    break
+                task = task.caller
+
+    def run_all_tasks(self):
+        while self.unfinished_tasks:
+            self._roll_task()
 
     def run_until_complete(self, generator: Generator):
-        task = Task(generator)
-        self._run_task(task)
-        while self.tasks:
-            self._roll_next_task()
-        
+        task = self.create_task(generator)
+        self.run_all_tasks()
+        return self._deal_with_result(task.result)
 
-    def run(self):
+    def run(self, generator: Generator):
+        task = self.create_task(generator)
+        while task.result is None:
+            self._roll_task()
+        self.unfinished_tasks.clear()
+        # noinspection PyTypeChecker
+        return self._deal_with_result(task.result)
+
+    # noinspection PyMethodMayBeStatic
+    def _deal_with_result(self, result: Result):
+        if result.exception:
+            raise result.exception
+        else:
+            return result.returned_value
